@@ -1,10 +1,11 @@
-// Bot de Trading para XAU/USD com CCI, ATR e OBV via Twelve Data
-require("dotenv").config();
-const axios = require("axios");
-const { Telegraf } = require("telegraf");
-const { EMA } = require("technicalindicators");
-const { Decimal } = require("decimal.js");
-const fs = require("fs").promises;
+import dotenv from 'dotenv';
+import axios from 'axios';
+import { Telegraf } from 'telegraf';
+import { EMA } from 'technicalindicators';
+import { Decimal } from 'decimal.js';
+import { promises as fs } from 'fs';
+
+dotenv.config();
 
 // ================= CONFIGURAÇÕES ================= //
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
@@ -18,24 +19,19 @@ const INTERVAL_1H = "1h";
 const EMA_FAST = 13;
 const EMA_SLOW = 21;
 const EMA_TREND = 50;
-const CCI_THRESHOLD_LONG = new Decimal("-100");
-const CCI_THRESHOLD_SHORT = new Decimal("100");
 const LEVERAGE = 10;
 const RISK_REWARD_RATIO = new Decimal("2.0");
 const INTERVALO_VERIFICACAO_MS = 15 * 60 * 1000;
-const INTERVALO_ENTRE_SINAIS_MS = 30 * 60 * 1000;
-let ultimoSinalEnviadoTimestamp = 0;
+const COOLDOWN_SINAL_MS = 30 * 60 * 1000; // 30 minutos de cooldown para sinais
+const HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutos para heartbeat
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+let ultimoSinalEnviadoTimestamp = 0;
+const sinaisAtivos = []; // Armazena sinais ativos pra rastrear TP/SL
 
 // ================= FUNÇÕES AUXILIARES ================= //
 async function fetchIndicator(indicator, symbol, interval, params = {}) {
   try {
-    const query = new URLSearchParams({
-      symbol,
-      interval,
-      apikey: TWELVE_DATA_API_KEY,
-      ...params
-    });
+    const query = new URLSearchParams({ symbol, interval, apikey: TWELVE_DATA_API_KEY, ...params });
     const url = `https://api.twelvedata.com/${indicator}?${query.toString()}`;
     const response = await axios.get(url);
     return response.data.values ? response.data.values.reverse() : null;
@@ -75,27 +71,95 @@ async function fetchPriceSeries(symbol, interval) {
   }
 }
 
-function isOBVRising(obvData) {
-  const last = parseFloat(obvData[obvData.length - 1]?.obv);
-  const prev = parseFloat(obvData[obvData.length - 2]?.obv);
-  return last > prev;
+// ================= RASTREAMENTO DE ALVOS ================= //
+async function checkTargets() {
+  try {
+    const currentPrice = await fetchCurrentPrice(SYMBOL_GOLD_API);
+    if (!currentPrice) {
+      console.error("Erro ao buscar preço para rastrear alvos.");
+      return;
+    }
+
+    for (let i = sinaisAtivos.length - 1; i >= 0; i--) {
+      const sinal = sinaisAtivos[i];
+      const { entry, tp, stop, direction, timestamp } = sinal;
+      let atingido = false;
+      let resultado = '';
+
+      if (direction === 1) { // LONG
+        if (currentPrice >= tp) {
+          atingido = true;
+          resultado = `✅ TP atingido (LONG) para XAU/USD!\nEntrada: ${entry.toFixed(2)}\nTP: ${tp.toFixed(2)}\nPreço Atual: ${currentPrice.toFixed(2)}`;
+        } else if (currentPrice <= stop) {
+          atingido = true;
+          resultado = `❌ SL atingido (LONG) para XAU/USD!\nEntrada: ${entry.toFixed(2)}\nSL: ${stop.toFixed(2)}\nPreço Atual: ${currentPrice.toFixed(2)}`;
+        }
+      } else if (direction === -1) { // SHORT
+        if (currentPrice <= tp) {
+          atingido = true;
+          resultado = `✅ TP atingido (SHORT) para XAU/USD!\nEntrada: ${entry.toFixed(2)}\nTP: ${tp.toFixed(2)}\nPreço Atual: ${currentPrice.toFixed(2)}`;
+        } else if (currentPrice >= stop) {
+          atingido = true;
+          resultado = `❌ SL atingido (SHORT) para XAU/USD!\nEntrada: ${entry.toFixed(2)}\nSL: ${stop.toFixed(2)}\nPreço Atual: ${currentPrice.toFixed(2)}`;
+        }
+      }
+
+      if (atingido) {
+        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, resultado);
+        await fs.appendFile("signal_report.csv", `${new Date(timestamp).toISOString()},XAU/USD,${direction === 1 ? "LONG" : "SHORT"},${entry.toFixed(2)},${tp.toFixed(2)},${stop.toFixed(2)},${resultado.includes("TP") ? "TP" : "SL"}\n`);
+        sinaisAtivos.splice(i, 1);
+      }
+    }
+  } catch (err) {
+    console.error("Erro ao verificar alvos:", err.message);
+  }
+}
+
+// ================= HEARTBEAT ================= //
+async function sendHeartbeat() {
+  try {
+    const data1h = await fetchPriceSeries(SYMBOL_TD, INTERVAL_1H);
+    if (!data1h) {
+      await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, "🤖 Bot ativo, mas não foi possível verificar a tendência no momento.");
+      return;
+    }
+    const trendH1 = data1h.close.at(-1) > EMA.calculate({ period: EMA_TREND, values: data1h.close }).at(-1);
+    const adxData = await fetchIndicator("adx", SYMBOL_TD, INTERVAL_15M, { time_period: 14 });
+    const adxValue = adxData && adxData.at(-1)?.adx ? parseFloat(adxData.at(-1).adx) : 0;
+    const trendStatus = trendH1 ? "Tendência de alta (1h)" : "Tendência de baixa ou neutra (1h)";
+    const signalStatus = Date.now() - ultimoSinalEnviadoTimestamp > COOLDOWN_SINAL_MS ? "Nenhum sinal recente." : "Aguardando cooldown para novo sinal.";
+    const activeSignals = sinaisAtivos.length ? `Sinais ativos: ${sinaisAtivos.length}` : "Nenhum sinal ativo.";
+    const message = `🤖 Bot ativo!\n${trendStatus}\nADX (15m): ${adxValue.toFixed(2)}\n${signalStatus}\n${activeSignals}`;
+    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, message);
+  } catch (err) {
+    console.error("Erro no heartbeat:", err.message);
+    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, "🤖 Bot ativo, mas ocorreu um erro ao verificar a tendência.");
+  }
 }
 
 // ================= LÓGICA DE SINAL ================= //
 async function checkSignals() {
   try {
-    console.log("\nVerificando sinais...");
+    // Verificar cooldown
+    if (Date.now() - ultimoSinalEnviadoTimestamp < COOLDOWN_SINAL_MS) {
+      await checkTargets();
+      return;
+    }
+
     const data15m = await fetchPriceSeries(SYMBOL_TD, INTERVAL_15M);
     const data1h = await fetchPriceSeries(SYMBOL_TD, INTERVAL_1H);
     const currentPrice = await fetchCurrentPrice(SYMBOL_GOLD_API);
 
     const cciData = await fetchIndicator("cci", SYMBOL_TD, INTERVAL_15M, { time_period: 20 });
-    const atrData = await fetchIndicator("atr", SYMBOL_TD, INTERVAL_15M, { time_period: 14 });
-    const obvData = await fetchIndicator("obv", SYMBOL_TD, INTERVAL_15M);
+    const atrData = await fetchIndicator("atr", SYMBOL_TD, INTERVAL_1H, { time_period: 14 });
+    const adxData = await fetchIndicator("adx", SYMBOL_TD, INTERVAL_15M, { time_period: 14 });
+    const plusDI = await fetchIndicator("plus_di", SYMBOL_TD, INTERVAL_15M, { time_period: 14 });
+    const minusDI = await fetchIndicator("minus_di", SYMBOL_TD, INTERVAL_15M, { time_period: 14 });
 
-    if (!data15m || !data1h || !currentPrice || !cciData || !atrData || !obvData) {
+    if (!data15m || !data1h || !currentPrice || !cciData || !atrData || !adxData || !plusDI || !minusDI) {
       console.error("Erro: Dados incompletos.");
       await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, "❌ Erro ao buscar dados para análise.");
+      await checkTargets();
       return;
     }
 
@@ -104,43 +168,58 @@ async function checkSignals() {
     const ema13 = EMA.calculate({ period: EMA_FAST, values: close15m });
     const ema21 = EMA.calculate({ period: EMA_SLOW, values: close15m });
     const ema50 = EMA.calculate({ period: EMA_TREND, values: close15m });
-    const trendH1 = data1h.close[data1h.close.length - 1] > EMA.calculate({ period: EMA_TREND, values: data1h.close }).slice(-1)[0];
+    const trendH1 = data1h.close.at(-1) > EMA.calculate({ period: EMA_TREND, values: data1h.close }).at(-1);
 
     const lastCCI = parseFloat(cciData.at(-1)?.cci);
     const lastATR = new Decimal(parseFloat(atrData.at(-1)?.atr || 0));
-    const obvRising = isOBVRising(obvData);
+    const adxValue = parseFloat(adxData.at(-1)?.adx || 0);
+    const plusDIValue = parseFloat(plusDI.at(-1)?.plus_di || 0);
+    const minusDIValue = parseFloat(minusDI.at(-1)?.minus_di || 0);
+    const tendenciaForte = adxValue > 20;
 
-    //const signalLong = trendH1 && (ema13.at(-1) > ema21.at(-1)) && (close15m.at(-1) > ema50.at(-1)) && lastCCI > 0 && obvRising;
-    const signalLong = (ema13.at(-1) > ema21.at(-1)) && (close15m.at(-1) > ema50.at(-1)) && lastCCI > -100 && obvRising;
-    const signalShort = !trendH1 && (ema13.at(-1) < ema21.at(-1)) && (close15m.at(-1) < ema50.at(-1)) && lastCCI < 100 && !obvRising;
+    const signalLong = trendH1 && tendenciaForte &&
+                       plusDIValue > minusDIValue &&
+                       ema13.at(-1) > ema21.at(-1) &&
+                       close15m.at(-1) > ema50.at(-1) &&
+                       lastCCI > -100;
+
+    const signalShort = !trendH1 && tendenciaForte &&
+                        minusDIValue > plusDIValue &&
+                        ema13.at(-1) < ema21.at(-1) &&
+                        close15m.at(-1) < ema50.at(-1) &&
+                        lastCCI < 100;
 
     const direction = signalLong ? 1 : signalShort ? -1 : 0;
 
-    console.log("==================== DEBUG ====================");
-    console.log(`CCI: ${lastCCI}, ATR: ${lastATR.toFixed(2)}, OBV subindo: ${obvRising}`);
-    console.log(`EMA13: ${ema13.at(-1)}, EMA21: ${ema21.at(-1)}, EMA50: ${ema50.at(-1)}`);
-    console.log(`Sinal: ${direction === 1 ? "LONG" : direction === -1 ? "SHORT" : "NEUTRO"}`);
-
-    if (direction === 0) return;
+    if (direction === 0) {
+      await checkTargets();
+      return;
+    }
 
     const entry = new Decimal(currentPrice);
     const stop = direction === 1 ? entry.minus(lastATR) : entry.plus(lastATR);
     const tp = direction === 1 ? entry.plus(lastATR.times(RISK_REWARD_RATIO)) : entry.minus(lastATR.times(RISK_REWARD_RATIO));
 
-    const msg = `${direction === 1 ? "🟢 LONG" : "🔴 SHORT"} XAU/USD\nEntrada: ${entry.toFixed(2)}\nTP: ${tp.toFixed(2)}\nSL: ${stop.toFixed(2)}\nCCI: ${lastCCI}\nOBV subindo: ${obvRising}`;
+    const msg = `${direction === 1 ? "🟢 LONG" : "🔴 SHORT"} XAU/USD\nEntrada: ${entry.toFixed(2)}\nTP: ${tp.toFixed(2)}\nSL: ${stop.toFixed(2)}\nCCI: ${lastCCI}\nADX: ${adxValue}\nDI+: ${plusDIValue}, DI-: ${minusDIValue}`;
     await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, msg);
 
+    // Registrar sinal no CSV e em sinaisAtivos
+    const signalData = { entry, tp, stop, direction, timestamp: Date.now() };
+    sinaisAtivos.push(signalData);
     await fs.appendFile("signal_report.csv", `${new Date().toISOString()},XAU/USD,${direction === 1 ? "LONG" : "SHORT"},${entry.toFixed(2)},${tp.toFixed(2)},${stop.toFixed(2)},PENDING\n`);
     ultimoSinalEnviadoTimestamp = Date.now();
+    await checkTargets();
   } catch (err) {
     console.error("Erro ao verificar sinais:", err.message);
+    await checkTargets();
   }
 }
 
 // ================= INICIALIZAÇÃO ================= //
 (async () => {
-  console.log("Bot iniciado!");
-  await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, "✅ Bot de XAU/USD iniciado via API!");
+  console.error("Bot iniciado!");
+  await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, "✅ Bot de XAU/USD com ADX/DI iniciado!");
   await checkSignals();
   setInterval(checkSignals, INTERVALO_VERIFICACAO_MS);
+  setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
 })();
